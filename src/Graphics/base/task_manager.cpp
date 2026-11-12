@@ -1,0 +1,257 @@
+/****************************************************************************
+** Copyright (c) 2016, Fougue SAS <https://www.fougue.pro>
+** SPDX-License-Identifier: BSD-2-Clause
+****************************************************************************/
+
+#include "task_manager.h"
+
+#include "cpp_utils.h"
+#include "task_progress.h"
+
+#include <atomic>
+#include <cassert>
+#include <future>
+#include <memory>
+#include <unordered_map>
+
+namespace Mayo {
+
+// Helper struct providing all required data to manage a Task object
+struct TaskManager::Entity {
+    TaskId taskId;
+    TaskJob taskJob;
+    TaskProgress taskProgress;
+    std::string title;
+    std::future<void> control;
+    std::atomic<bool> isFinished = false;
+    TaskAutoDestroy autoDestroy = TaskAutoDestroy::On;
+};
+
+// Pimpl struct providing private(hidden) interface of TaskManager class
+struct TaskManager::Private {
+    // Ctor
+    explicit Private(TaskManager* mgr) : taskMgr(mgr) {}
+
+    // Const/mutable functions to find an Entity from a task identifier. Returns null if not found
+    TaskManager::Entity* findEntity(TaskId id);
+    const TaskManager::Entity* findEntity(TaskId id) const;
+
+    // Execute(synchronous) task entity, sending started/ended signals accordingly
+    void execEntity(TaskManager::Entity* entity);
+
+    // Destroy finished task entities whose policy was set to TaskAutoDestroy::On
+    void cleanGarbage();
+
+    TaskManager* taskMgr = nullptr;
+    std::atomic<TaskId> taskIdSeq = {};
+    std::unordered_map<TaskId, std::unique_ptr<TaskManager::Entity>> mapEntity;
+};
+
+TaskManager::TaskManager()
+    : d(new Private(this))
+{
+}
+
+TaskManager::~TaskManager()
+{
+    // Make sure all tasks are really finished
+    for (const auto& mapPair : d->mapEntity) {
+        const std::unique_ptr<Entity>& ptrEntity = mapPair.second;
+        if (ptrEntity->control.valid())
+            ptrEntity->control.wait();
+    }
+
+    // Erase the task from its container before destruction, this will allow TaskProgress destructor
+    // to behave correctly (it calls TaskProgress::setValue())
+    for (auto it = d->mapEntity.begin(); it != d->mapEntity.end(); )
+        it = d->mapEntity.erase(it);
+
+    delete d;
+}
+
+TaskId TaskManager::newTask(TaskJob fn)
+{
+    const TaskId taskId = d->taskIdSeq.fetch_add(1);
+    auto ptrEntity = std::make_unique<Entity>();
+    ptrEntity->taskId = taskId;
+    ptrEntity->taskJob = std::move(fn);
+    ptrEntity->taskProgress.setTaskId(taskId);
+    ptrEntity->taskProgress.setTaskManager(this);
+    d->mapEntity.insert({ taskId, std::move(ptrEntity) });
+    return taskId;
+}
+
+void TaskManager::run(TaskId id, TaskAutoDestroy policy)
+{
+    d->cleanGarbage();
+    Entity* entity = d->findEntity(id);
+    if (!entity)
+        return;
+
+    entity->isFinished = false;
+    entity->autoDestroy = policy;
+    // NOSONAR[cpp:S8460] Intentional usage of std::async() here
+    //   * The returned future is stored in entity->control, so the destructor-blocking behavior is
+    //     controlled
+    //   * The std::launch::async policy is specified, if not the default is async|deferred and
+    //     which one gets selected is implementation-defined
+    entity->control = std::async(std::launch::async, [=]{ d->execEntity(entity); }); // NOSONAR
+}
+
+void TaskManager::exec(TaskId id, TaskAutoDestroy policy)
+{
+    d->cleanGarbage();
+    Entity* entity = d->findEntity(id);
+    if (!entity)
+        return;
+
+    entity->isFinished = false;
+    entity->autoDestroy = policy;
+    d->execEntity(entity);
+}
+
+bool TaskManager::waitForDone(TaskId id, int msecs)
+{
+    const Entity* entity = d->findEntity(id);
+    if (!entity)
+        return true;
+
+    if (!entity->control.valid())
+        return true;
+
+    if (msecs < 0) {
+        entity->control.wait();
+        return true;
+    }
+
+    return entity->control.wait_for(std::chrono::milliseconds(msecs)) == std::future_status::ready;
+}
+
+void TaskManager::requestAbort(TaskId id)
+{
+    Entity* entity = d->findEntity(id);
+    if (entity) {
+        this->signalAbortRequested.send(id);
+        entity->taskProgress.requestAbort();
+    }
+}
+
+bool TaskManager::destroy(TaskId id)
+{
+    const auto it = d->mapEntity.find(id);
+    if (it == d->mapEntity.end())
+        return false;
+
+    const Entity* entity = it->second.get();
+    if (!entity || !entity->isFinished)
+        return false;
+
+    if (entity->control.valid())
+        entity->control.wait();
+
+    d->mapEntity.erase(it);
+    return true;
+}
+
+void TaskManager::foreachTask(const std::function<void(TaskId)>& fn)
+{
+    for (const auto& mapPair : d->mapEntity)
+        fn(mapPair.first);
+}
+
+double TaskManager::progress(TaskId id) const
+{
+    const Entity* entity = d->findEntity(id);
+    return entity ? entity->taskProgress.value() : 0.;
+}
+
+double TaskManager::globalProgress() const
+{
+    if (d->mapEntity.empty())
+        return 0.;
+
+    double taskAccumPct = 0.;
+    for (const auto& [taskId, ptrEntity] : d->mapEntity)
+        taskAccumPct += ptrEntity->taskProgress.value();
+
+    return taskAccumPct / d->mapEntity.size();
+}
+
+const std::string& TaskManager::title(TaskId id) const
+{
+    const Entity* entity = d->findEntity(id);
+    return entity ? entity->title : Cpp::staticObject<std::string>();
+}
+
+void TaskManager::setTitle(TaskId id, std::string_view title)
+{
+    Entity* entity = d->findEntity(id);
+    if (entity)
+        entity->title = title;
+}
+
+TaskManager::Entity* TaskManager::Private::findEntity(TaskId id)
+{
+    auto it = this->mapEntity.find(id);
+    return it != this->mapEntity.end() ? it->second.get() : nullptr;
+}
+
+const TaskManager::Entity* TaskManager::Private::findEntity(TaskId id) const
+{
+    auto it = this->mapEntity.find(id);
+    return it != this->mapEntity.cend() ? it->second.get() : nullptr;
+}
+
+void TaskManager::Private::execEntity(Entity* entity)
+{
+    if (!entity)
+        return;
+
+    this->taskMgr->signalStarted.send(entity->taskId);
+
+    TaskEndReason endReason = TaskEndReason::Failed;
+
+    // Task jobs must never let exceptions escape from this function. Tasks are typically executed
+    // through std::async() and their future is not consumed with get(), so an exception escaping
+    // here would remain stored in the future. In that case, the "ended" signal would never be sent
+    // and the task would remain unfinished
+    try {
+        const TaskJob& fn = entity->taskJob;
+        fn(&entity->taskProgress);
+
+        if (entity->taskProgress.isAbortRequested()) {
+            endReason = TaskEndReason::Aborted;
+        }
+        else {
+            entity->taskProgress.setValue(100);
+            endReason = TaskEndReason::Completed;
+        }
+    }
+    catch (...) {
+        // Task job failed but nothing to report here as the job is responsible for translating
+        // errors into messages
+        endReason = TaskEndReason::Failed;
+    }
+
+    entity->isFinished = true;
+    this->taskMgr->signalEnded.send(entity->taskId, endReason);
+}
+
+void TaskManager::Private::cleanGarbage()
+{
+    auto it = this->mapEntity.begin();
+    while (it != this->mapEntity.end()) {
+        const Entity* entity = it->second.get();
+        if (entity->isFinished && entity->autoDestroy == TaskAutoDestroy::On) {
+            if (entity->control.valid())
+                entity->control.wait();
+
+            it = this->mapEntity.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
+} // namespace Mayo

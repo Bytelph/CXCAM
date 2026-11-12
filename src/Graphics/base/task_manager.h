@@ -1,0 +1,105 @@
+/****************************************************************************
+** Copyright (c) 2016, Fougue SAS <https://www.fougue.pro>
+** SPDX-License-Identifier: BSD-2-Clause
+****************************************************************************/
+
+#pragma once
+
+#include "signal.h"
+#include "task_common.h"
+#include "task_job.h"
+
+#include <functional>
+#include <string>
+#include <string_view>
+
+namespace Mayo {
+
+// Central class providing creation/execution/deletion of Task objects
+//
+// TaskManager is thread-affine. All operations that access or modify the tasks (such as newTask(),
+// run(), exec(), destroy(), and task queries) must be performed from the thread that owns
+// the TaskManager instance
+// Task jobs themselves may execute on worker threads. A task job must therefore not directly access
+// or modify the TaskManager. Results or completion notifications that need to interact with the
+// TaskManager must be posted back to its owning thread
+// This design intentionally avoids locking the task collection. The thread-affinity requirement is
+// part of the TaskManager contract and must be respected by its callers
+class TaskManager {
+public:
+    // Ctor & dtor
+    TaskManager();
+    ~TaskManager();
+
+    // Not copyable
+    TaskManager(const TaskManager&) = delete;
+    TaskManager& operator=(const TaskManager&) = delete;
+
+    // Allocates a new task entity in manager
+    // Returns the task identifier(unique in the scope of the owning TaskManager)
+    // IMPORTANT
+    // The job must handle/report all expected errors itself. Exceptions escaping a TaskJob are
+    // caught by TaskManager and do not propagate to the caller
+    TaskId newTask(TaskJob fn);
+
+    // Asynchronous execution of job associated with task identifier 'id'
+    // By default destroy policy is set to 'On' meaning the task will be deleted at some point
+    // after its completion
+    // This function is based on std::async() so depending on the C++ stdlib implementation this is
+    // probably using a thread pool
+    // NOTE The task must have been allocated previously with newTask()
+    void run(TaskId id, TaskAutoDestroy policy = TaskAutoDestroy::On);
+
+    // Same as run() but execution of the task job is synchronous(it runs in the current thread
+    // just like a regular function call)
+    void exec(TaskId id, TaskAutoDestroy policy = TaskAutoDestroy::On);
+
+    // Current progress of task identified by 'id'
+    // NOTE The task must have been allocated previously with newTask()
+    double progress(TaskId id) const;
+
+    // Current progress of all tasks
+    double globalProgress() const;
+
+    // Title(description) of a task identified by 'id'
+    const std::string& title(TaskId id) const;
+    void setTitle(TaskId id, std::string_view title);
+
+    // Blocks the current thread until task of identifier 'id' has finished
+    bool waitForDone(TaskId id, int msecs = -1);
+
+    // Instructs the task of identifier 'id' to abort as soon as possible
+    // Task interruption relies on the task job for this: it has to check regularly the
+    // TaskProgress::isAbortRequested() flag and interrupt consequently
+    void requestAbort(TaskId id);
+
+    // Destroys a finished task
+    // Does nothing if the task does not exist or is still running
+    bool destroy(TaskId id);
+
+    // Applies function 'fn' to each task
+    void foreachTask(const std::function<void(TaskId)>& fn);
+
+    // Signal emitted when some task execution has just started
+    Signal<TaskId> signalStarted;
+
+    // Signal emitted when the current step description of some task has changed
+    Signal<TaskId, const std::string&> signalProgressStep;
+
+    // Signal emitted when the current progress of some task has changed
+    Signal<TaskId, double> signalProgressChanged;
+
+    // Signal emitted when requestAbort() was called on some task
+    Signal<TaskId> signalAbortRequested;
+
+    // Signal emitted when some task execution has just ended(whatever stop condition: finished
+    // or aborted)
+    Signal<TaskId, TaskEndReason> signalEnded;
+
+private:
+    struct Entity;
+    struct Private;
+    Private* const d = nullptr;
+};
+
+} // namespace Mayo

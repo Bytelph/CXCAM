@@ -1,0 +1,21 @@
+<RCC>
+    <qresource prefix="/">
+        <file>qml/Theme.qml</file>
+        <file>qml/Main.qml</file>
+        <file>qml/TitleBar.qml</file>
+        <file>qml/TextButton.qml</file>
+        <file>qml/WindowButton.qml</file>
+        <file>qml/WindowResizeHandle.qml</file>
+        <file>qml/Ribbon.qml</file>
+        <file>qml/RibbonPage.qml</file>
+        <file>qml/RibbonGroup.qml</file>
+        <file>qml/RibbonButton.qml</file>
+        <file>qml/RibbonSeparator.qml</file>
+        <file>qml/ProjectPanel.qml</file>
+        <file>qml/TreeSection.qml</file>
+        <file>qml/TreeRow.qml</file>
+        <file>qml/Viewport.qml</file>
+        <file>qml/OccViewport.qml</file>
+        <file>qml/StatusBar.qml</file>
+    </qresource>
+</RCC>

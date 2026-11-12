@@ -1,0 +1,5 @@
+if(CXCAM_WITH_OCCT)
+    add_subdirectory(Graphics)
+endif()
+add_subdirectory(Gui)
+add_subdirectory(Main)

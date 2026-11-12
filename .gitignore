@@ -1,0 +1,18 @@
+# Build
+/build/
+/build-*/
+/cmake-build-*/
+*.user
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+
+# IDE
+/.vs/
+/.vscode/
+/.idea/
+*.vcxproj.user
+
+# OS
+Thumbs.db
+.DS_Store
